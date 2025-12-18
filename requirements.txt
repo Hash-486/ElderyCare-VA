@@ -1,0 +1,12 @@
+torch
+torchaudio
+openai-whisper
+transformers>=4.30.0
+tokenizers
+spacy>=3.5.0
+scipy
+pandas
+numpy
+pyyaml
+contractions
+textblob

@@ -1,0 +1,9 @@
+stt:
+  model: "large"  
+  language: "en"
+  device: "cuda" 
+
+preprocess:
+  expand_contractions: true
+  normalize_medical_abbrev: true
+  handle_negation: true
