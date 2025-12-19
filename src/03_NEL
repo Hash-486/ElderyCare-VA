@@ -1,0 +1,259 @@
+# ============================================================
+# INSTALL (RUN ONCE IN COLAB)
+# ============================================================
+#!pip install -q whisper transformers torch pandas sentence-transformers tqdm
+
+# ============================================================
+# IMPORTS
+# ============================================================
+
+import os
+import json
+import gzip
+import torch
+import whisper
+import pandas as pd
+from transformers import pipeline
+from sentence_transformers import SentenceTransformer, util
+from collections import Counter
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+config = {
+    "stt": {
+        "model": "base",
+        "device": "cuda" if torch.cuda.is_available() else "cpu"
+    },
+    "ner": {
+        "model": "d4data/biomedical-ner-all",
+        "confidence_threshold": 0.60
+    },
+    "nel": {
+        "similarity_threshold": 0.65
+    }
+}
+
+# ============================================================
+# STT MODULE (WHISPER)
+# ============================================================
+
+class VoiceToTextPipeline:
+    def __init__(self, config):
+        print("🎙️ Loading Whisper STT model...")
+        self.model = whisper.load_model(
+            config["stt"]["model"],
+            device=config["stt"]["device"]
+        )
+        print("✅ Whisper ready\n")
+
+    def transcribe(self, audio_path):
+        audio = whisper.load_audio(audio_path)
+        audio = whisper.pad_or_trim(audio)
+        result = self.model.transcribe(audio, language="en", fp16=False)
+        return result["text"].strip()
+
+# ============================================================
+# NER MODULE (CLINICAL)
+# ============================================================
+
+class ClinicalNER:
+    def __init__(self, config):
+        print("🧠 Loading Clinical NER model...")
+        self.threshold = config["ner"]["confidence_threshold"]
+        self.ner = pipeline(
+            "ner",
+            model=config["ner"]["model"],
+            tokenizer=config["ner"]["model"],
+            aggregation_strategy="simple"
+        )
+        print("✅ NER ready\n")
+
+    def extract(self, text):
+        raw = self.ner(text)
+        return [
+            {
+                "text": r["word"],
+                "label": r["entity_group"],
+                "confidence": round(r["score"], 3)
+            }
+            for r in raw if r["score"] >= self.threshold
+        ]
+
+# ============================================================
+# SIMPLE NER EVALUATION
+# ============================================================
+
+def evaluate_ner(entities):
+    print("\n📊 NER SUMMARY")
+    print("-" * 50)
+    counts = Counter([e["label"] for e in entities])
+    print(f"Total entities extracted: {len(entities)}")
+    for k, v in counts.items():
+        print(f"{k:15s}: {v}")
+    print("-" * 50)
+
+# ============================================================
+# HPO JSON → LOOKUP TABLE (FIXED)
+# ============================================================
+
+def build_hpo_lookup(hpo_path, output_csv):
+    print(f"📂 Loading HPO file: {hpo_path}")
+
+    if hpo_path.endswith(".gz"):
+        with gzip.open(hpo_path, "rt", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        with open(hpo_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+    rows = []
+
+    for graph in data.get("graphs", []):
+        for node in graph.get("nodes", []):
+            raw_id = node.get("id", "")
+
+            # ✅ FIX: HPO IDs are URLs with HP_
+            if "HP_" not in raw_id:
+                continue
+
+            # Convert URL ID → HP:000xxxx
+            hp_id = "HP:" + raw_id.split("HP_")[-1]
+
+            # Canonical label
+            label = node.get("lbl")
+            if label:
+                rows.append({"hp_id": hp_id, "term": label.lower()})
+
+            # Synonyms
+            for syn in node.get("meta", {}).get("synonyms", []):
+                val = syn.get("val")
+                if val:
+                    rows.append({"hp_id": hp_id, "term": val.lower()})
+
+    df = pd.DataFrame(rows).drop_duplicates()
+    df.to_csv(output_csv, index=False)
+
+    print(f"✅ HPO lookup table created: {output_csv}")
+    print(f"🔢 Total phenotype terms indexed: {len(df)}\n")
+
+# ============================================================
+# HPO NEL MODULE
+# ============================================================
+
+class HPONEL:
+    def __init__(self, lookup_csv, similarity_threshold):
+        print("🔗 Initializing HPO NEL...")
+        self.df = pd.read_csv(lookup_csv)
+        self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.threshold = similarity_threshold
+
+        print("🔢 Encoding HPO terms (one-time)...")
+        self.embeddings = self.encoder.encode(
+            self.df["term"].tolist(),
+            convert_to_tensor=True,
+            show_progress_bar=True
+        )
+        print("✅ HPO NEL ready\n")
+
+    def link(self, mention):
+        query_emb = self.encoder.encode(
+            mention.lower(),
+            convert_to_tensor=True
+        )
+
+        scores = util.cos_sim(query_emb, self.embeddings)[0]
+        best_idx = scores.argmax().item()
+        best_score = scores[best_idx].item()
+
+        if best_score < self.threshold:
+            return None
+
+        return {
+            "entity_text": mention,
+            "hp_id": self.df.iloc[best_idx]["hp_id"],
+            "canonical_term": self.df.iloc[best_idx]["term"],
+            "confidence": round(best_score, 3)
+        }
+
+# ============================================================
+# FULL PIPELINE
+# ============================================================
+
+class ElderlyCarePipeline:
+    def __init__(self, config, hpo_lookup_csv):
+        self.stt = VoiceToTextPipeline(config)
+        self.ner = ClinicalNER(config)
+        self.nel = HPONEL(
+            hpo_lookup_csv,
+            config["nel"]["similarity_threshold"]
+        )
+
+    def run(self, audio_path):
+        print("\n🚀 RUNNING FULL PIPELINE\n")
+
+        # ---------- STT ----------
+        text = self.stt.transcribe(audio_path)
+        print("📝 TRANSCRIBED TEXT")
+        print("=" * 80)
+        print(text)
+        print("=" * 80)
+
+        # ---------- NER ----------
+        entities = self.ner.extract(text)
+        print("\n🧩 NER OUTPUT")
+        print("=" * 80)
+        if not entities:
+            print("No clinical entities detected.")
+        else:
+            for e in entities:
+                print(f"{e['text']:25s} → {e['label']} (conf={e['confidence']})")
+        print("=" * 80)
+
+        evaluate_ner(entities)
+
+        # ---------- NEL ----------
+        print("\n🔗 HPO NEL OUTPUT")
+        print("=" * 80)
+
+        linked = []
+        for e in entities:
+            if e["label"] in ["SYMPTOM", "DISEASE"]:
+                link = self.nel.link(e["text"])
+                if link:
+                    linked.append(link)
+
+        if not linked:
+            print("No HPO concepts linked.")
+        else:
+            for l in linked:
+                print(
+                    f"{l['entity_text']:20s} → {l['canonical_term']} "
+                    f"({l['hp_id']}) conf={l['confidence']}"
+                )
+        print("=" * 80)
+
+        return {
+            "text": text,
+            "ner_entities": entities,
+            "hpo_links": linked
+        }
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    AUDIO_FILE = "/content/CAR0001.mp3"   # 🔴 change to your audio file
+    HPO_FILE = "/content/hp.json"         # 🔴 hp.json or hp.json.gz
+    HPO_LOOKUP = "/content/hpo_lookup.csv"
+
+    # Build HPO lookup (run once)
+    build_hpo_lookup(HPO_FILE, HPO_LOOKUP)
+
+    # Run full pipeline
+    system = ElderlyCarePipeline(config, HPO_LOOKUP)
+    output = system.run(AUDIO_FILE)
+#
