@@ -1,7 +1,8 @@
 # ============================================================
 # INSTALL (RUN ONCE IN COLAB)
 # ============================================================
-#!pip install -q whisper transformers torch pandas sentence-transformers tqdm
+!pip uninstall -y whisper > /dev/null 2>&1 || true
+!pip install -q openai-whisper transformers torch pandas sentence-transformers tqdm
 
 # ============================================================
 # IMPORTS
@@ -219,7 +220,7 @@ class ElderlyCarePipeline:
 
         linked = []
         for e in entities:
-            if e["label"] in ["SYMPTOM", "DISEASE"]:
+            if e["label"] in ["Sign_symptom", "Disease_disorder"]:
                 link = self.nel.link(e["text"])
                 if link:
                     linked.append(link)
@@ -246,7 +247,7 @@ class ElderlyCarePipeline:
 
 if __name__ == "__main__":
 
-    AUDIO_FILE = "/content/CAR0001.mp3"   # 🔴 change to your audio file
+    AUDIO_FILE = "/content/GEN0001.mp3"   # 🔴 change to your audio file
     HPO_FILE = "/content/hp.json"         # 🔴 hp.json or hp.json.gz
     HPO_LOOKUP = "/content/hpo_lookup.csv"
 
@@ -256,4 +257,4 @@ if __name__ == "__main__":
     # Run full pipeline
     system = ElderlyCarePipeline(config, HPO_LOOKUP)
     output = system.run(AUDIO_FILE)
-#
+
