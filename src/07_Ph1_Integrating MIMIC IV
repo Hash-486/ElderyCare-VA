@@ -1,0 +1,256 @@
+# ============================================================
+# INSTALL
+# ============================================================
+#!pip install -q openai-whisper transformers torch pandas sentence-transformers tqdm
+
+# ============================================================
+# IMPORTS
+# ============================================================
+import whisper
+import torch
+import pandas as pd
+import json
+from transformers import pipeline
+from sentence_transformers import SentenceTransformer, util
+from datetime import datetime
+
+# ============================================================
+# CONFIG
+# ============================================================
+NER_MODEL = "d4data/biomedical-ner-all"
+NER_THRESHOLD = 0.60
+NEL_THRESHOLD = 0.65
+
+# ============================================================
+# STT MODULE
+# ============================================================
+class VoiceToTextPipeline:
+    def __init__(self):
+        self.model = whisper.load_model("base")
+
+    def transcribe(self, audio_path):
+        return self.model.transcribe(
+            audio_path,
+            language="en",
+            fp16=False,
+            verbose=False
+        )["text"]
+
+# ============================================================
+# NER MODULE
+# ============================================================
+class ClinicalNER:
+    def __init__(self):
+        self.ner = pipeline(
+            "ner",
+            model=NER_MODEL,
+            tokenizer=NER_MODEL,
+            aggregation_strategy="simple"
+        )
+
+    def extract(self, text):
+        return [
+            {
+                "text": r["word"],
+                "label": r["entity_group"],
+                "confidence": float(r["score"])
+            }
+            for r in self.ner(text)
+            if r["score"] >= NER_THRESHOLD
+        ]
+
+# ============================================================
+# HPO LOOKUP BUILDER
+# ============================================================
+def build_hpo_lookup(hpo_json, output_csv):
+    with open(hpo_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    rows = []
+    for graph in data.get("graphs", []):
+        for node in graph.get("nodes", []):
+            if "HP_" not in node.get("id", ""):
+                continue
+            hp_id = "HP:" + node["id"].split("HP_")[-1]
+            if node.get("lbl"):
+                rows.append({"hp_id": hp_id, "term": node["lbl"].lower()})
+            for syn in node.get("meta", {}).get("synonyms", []):
+                rows.append({"hp_id": hp_id, "term": syn["val"].lower()})
+
+    pd.DataFrame(rows).drop_duplicates().to_csv(output_csv, index=False)
+    print("✅ HPO lookup built")
+
+# ============================================================
+# HPO NEL
+# ============================================================
+class HPONEL:
+    def __init__(self, lookup_csv):
+        self.df = pd.read_csv(lookup_csv)
+        self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.embeddings = self.encoder.encode(
+            self.df["term"].tolist(),
+            convert_to_tensor=True,
+            show_progress_bar=True
+        )
+
+    def link(self, text):
+        q = self.encoder.encode(text.lower(), convert_to_tensor=True)
+        scores = util.cos_sim(q, self.embeddings)[0]
+        idx = scores.argmax().item()
+        score = scores[idx].item()
+        if score < NEL_THRESHOLD:
+            return None
+        return {
+            "hp_id": self.df.iloc[idx]["hp_id"],
+            "concept": self.df.iloc[idx]["term"],
+            "confidence": round(score, 3)
+        }
+
+# ============================================================
+# EVENT CREATOR
+# ============================================================
+def make_event(patient_id, timestamp, hp_link, source):
+    return {
+        "patient_id": patient_id,
+        "timestamp": timestamp,
+        "hp_id": hp_link["hp_id"],
+        "concept": hp_link["concept"],
+        "confidence": hp_link["confidence"],
+        "source": source
+    }
+
+# ============================================================
+# AUDIO → EVENTS
+# ============================================================
+def events_from_audio(audio_path, patient_id, stt, ner, nel):
+    text = stt.transcribe(audio_path)
+    entities = ner.extract(text)
+    events = []
+    for e in entities:
+        link = nel.link(e["text"])
+        if link:
+            events.append(
+                make_event(
+                    patient_id,
+                    datetime.now().isoformat(),
+                    link,
+                    "audio"
+                )
+            )
+    return events
+
+# ============================================================
+# MIMIC-IV CSV → EVENTS (ICD → HPO)
+# ============================================================
+def events_from_mimic_csv(diagnoses_csv, admissions_csv, nel):
+    diagnoses = pd.read_csv(diagnoses_csv)
+    admissions = pd.read_csv(admissions_csv)
+
+    adm_time = admissions.set_index("hadm_id")["admittime"].to_dict()
+    events = []
+
+    for _, row in diagnoses.iterrows():
+        icd_code = str(row["icd_code"])
+        patient_id = row["subject_id"]
+        timestamp = adm_time.get(row["hadm_id"], None)
+
+        if timestamp is None:
+            continue
+
+        link = nel.link(icd_code)
+        if link:
+            events.append(
+                make_event(
+                    patient_id,
+                    timestamp,
+                    link,
+                    "mimic_icd"
+                )
+            )
+    return events
+
+# ============================================================
+# TEMPORAL FEATURES (FIXED)
+# ============================================================
+def extract_temporal_features(event_log):
+    df = pd.DataFrame(event_log)
+    if df.empty:
+        return df
+
+    # 🔧 FIX: robust mixed-format timestamp parsing
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        format="mixed",
+        errors="coerce"
+    )
+
+    # drop rows with invalid timestamps
+    df = df.dropna(subset=["timestamp"])
+
+    now = pd.Timestamp.now()
+
+    freq = df.groupby(["patient_id", "hp_id"]).size().reset_index(name="total_count")
+    last = df.groupby(["patient_id", "hp_id"])["timestamp"].max().reset_index()
+
+    last["time_since_last_hours"] = (
+        now - last["timestamp"]
+    ).dt.total_seconds() / 3600
+
+    recent = df[df["timestamp"] >= now - pd.Timedelta(hours=24)]
+    count_24h = recent.groupby(["patient_id", "hp_id"]).size().reset_index(name="count_24h")
+
+    out = freq.merge(last, on=["patient_id", "hp_id"])
+    out = out.merge(count_24h, on=["patient_id", "hp_id"], how="left")
+    out["count_24h"] = out["count_24h"].fillna(0)
+
+    return out
+
+# ============================================================
+# TEMPORAL RISK
+# ============================================================
+def temporal_risk_decision(df):
+    def decide(r):
+        if r["count_24h"] >= 2 and r["time_since_last_hours"] <= 1:
+            return "HIGH"
+        elif r["count_24h"] >= 1 and r["time_since_last_hours"] <= 6:
+            return "MODERATE"
+        return "LOW"
+
+    df["risk_level"] = df.apply(decide, axis=1)
+    return df
+
+# ============================================================
+# MAIN
+# ============================================================
+if __name__ == "__main__":
+
+    AUDIO_FILE = "/content/daddy1.ogg"
+    HPO_JSON = "/content/hp.json"
+    HPO_LOOKUP = "/content/hpo_lookup.csv"
+    MIMIC_DIAG = "/content/diagnoses_icd.csv"
+    MIMIC_ADM  = "/content/admissions.csv"
+
+    build_hpo_lookup(HPO_JSON, HPO_LOOKUP)
+
+    stt = VoiceToTextPipeline()
+    ner = ClinicalNER()
+    nel = HPONEL(HPO_LOOKUP)
+
+    event_log = []
+
+    if AUDIO_FILE:
+        event_log.extend(
+            events_from_audio(AUDIO_FILE, "AUDIO_PATIENT", stt, ner, nel)
+        )
+
+    event_log.extend(
+        events_from_mimic_csv(MIMIC_DIAG, MIMIC_ADM, nel)
+    )
+
+    print(f"\n📦 TOTAL EVENTS: {len(event_log)}")
+
+    temporal = extract_temporal_features(event_log)
+    risk = temporal_risk_decision(temporal)
+
+    print("\n🚦 RISK OUTPUT")
+    print(risk.head())
