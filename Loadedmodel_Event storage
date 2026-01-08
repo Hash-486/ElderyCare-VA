@@ -1,0 +1,175 @@
+# ============================================================
+# INSTALL (RUN ONCE)
+# ============================================================
+# !pip install -q openai-whisper transformers torch pandas sentence-transformers scikit-learn joblib
+
+# ============================================================
+# IMPORTS
+# ============================================================
+import whisper
+import pandas as pd
+from transformers import pipeline
+from sentence_transformers import SentenceTransformer, util
+from datetime import datetime
+import joblib
+import os
+
+# ============================================================
+# CONFIG
+# ============================================================
+NER_MODEL = "d4data/biomedical-ner-all"
+NER_THRESHOLD = 0.60
+NEL_THRESHOLD = 0.65
+ALLOWED_NER_LABELS = {
+    "Sign_symptom",
+    "Disease_disorder"
+}
+
+MODEL_PATH = "/content/risk_model.joblib"
+SCALER_PATH = "/content/risk_scaler.joblib"
+HPO_LOOKUP = "/content/hpo_lookup.csv"
+EVENT_STORE = "/content/patient_events.csv"
+
+# ============================================================
+# STT
+# ============================================================
+class VoiceToTextPipeline:
+    def __init__(self):
+        self.model = whisper.load_model("base")
+
+    def transcribe(self, audio_path):
+        return self.model.transcribe(audio_path, language="en", fp16=False)["text"]
+
+# ============================================================
+# NER
+# ============================================================
+class ClinicalNER:
+    def __init__(self):
+        self.ner = pipeline("ner", model=NER_MODEL, tokenizer=NER_MODEL, aggregation_strategy="simple")
+
+    def extract(self, text):
+        out = []
+        for r in self.ner(text):
+            if r["score"] >= NER_THRESHOLD and r["entity_group"] in ALLOWED_NER_LABELS:
+                out.append(r["word"])
+        return list(set(out))
+
+# ============================================================
+# HPO LINKER
+# ============================================================
+class HPONEL:
+    def __init__(self, lookup_csv):
+        self.df = pd.read_csv(lookup_csv)
+        self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.embeddings = self.encoder.encode(self.df["term"].tolist(), convert_to_tensor=True)
+
+    def link(self, text):
+        q = self.encoder.encode(text.lower(), convert_to_tensor=True)
+        scores = util.cos_sim(q, self.embeddings)[0]
+        idx = scores.argmax().item()
+        if scores[idx].item() < NEL_THRESHOLD:
+            return None
+        return self.df.iloc[idx]
+
+# ============================================================
+# EVENT STORE
+# ============================================================
+def save_events(events):
+    df = pd.DataFrame(events)
+    if os.path.exists(EVENT_STORE):
+        df_old = pd.read_csv(EVENT_STORE)
+        df = pd.concat([df_old, df])
+    df.to_csv(EVENT_STORE, index=False)
+
+# ============================================================
+# AUDIO → EVENTS
+# ============================================================
+def events_from_audio(audio_path, stt, ner, nel):
+    text = stt.transcribe(audio_path)
+    print("🎧 TRANSCRIPTION:", text)
+
+    ents = ner.extract(text)
+    print("✅ ENTITIES:", ents)
+
+    events = []
+    for e in ents:
+        link = nel.link(e)
+        if link is not None:
+            events.append({
+                "hp_id": link["hp_id"],
+                "concept": link["term"],
+                "timestamp": datetime.now()
+            })
+    return events
+
+# ============================================================
+# TEMPORAL FEATURES
+# ============================================================
+def extract_temporal_features(events):
+    df = pd.DataFrame(events)
+    if df.empty:
+        return None
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    now = pd.Timestamp.now()
+
+    freq = df.groupby(["hp_id", "concept"]).size().reset_index(name="total_count")
+    last = df.groupby("hp_id")["timestamp"].max().reset_index()
+    last["time_since_last_hours"] = (now - last["timestamp"]).dt.total_seconds() / 3600
+
+    recent = df[df["timestamp"] >= now - pd.Timedelta(hours=24)]
+    count_24h = recent.groupby("hp_id").size().reset_index(name="count_24h")
+
+    out = freq.merge(last, on="hp_id").merge(count_24h, on="hp_id", how="left")
+    out["count_24h"] = out["count_24h"].fillna(0)
+    return out
+
+# ============================================================
+# FINAL RISK
+# ============================================================
+def summarize_risk(df):
+    priority = {"LOW":0, "MODERATE":1, "HIGH":2}
+    df["score"] = df["ml_risk"].map(priority)
+    top = df.sort_values("score", ascending=False).iloc[0]
+    return top["ml_risk"], top["concept"]
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    AUDIO_FILE = "/content/daddy1.ogg"
+
+    print("🔹 Loading saved model...")
+    model = joblib.load(MODEL_PATH)
+    scaler = joblib.load(SCALER_PATH)
+
+    stt = VoiceToTextPipeline()
+    ner = ClinicalNER()
+    nel = HPONEL(HPO_LOOKUP)
+
+    print("🔹 Processing audio...")
+    events = events_from_audio(AUDIO_FILE, stt, ner, nel)
+
+    if not events:
+        print("❌ No usable medical events found.")
+        return
+
+    save_events(events)
+
+    temporal = extract_temporal_features(events)
+    X = temporal[["total_count", "count_24h", "time_since_last_hours"]]
+    Xs = scaler.transform(X)
+
+    preds = model.predict(Xs)
+    mapping = {0:"LOW", 1:"MODERATE", 2:"HIGH"}
+    temporal["ml_risk"] = [mapping[p] for p in preds]
+
+    print("\n📊 EVENT LEVEL RISK")
+    print(temporal)
+
+    risk, cause = summarize_risk(temporal)
+    print(f"\n🚨 FINAL AUDIO RISK → {risk} due to {cause}")
+
+# ============================================================
+if __name__ == "__main__":
+    main()
