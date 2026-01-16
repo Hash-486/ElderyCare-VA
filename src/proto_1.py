@@ -7,6 +7,7 @@ from datetime import datetime
 import torch
 import os
 import numpy as np
+import hashlib
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
@@ -43,7 +44,7 @@ if DEVICE == "cuda":
     torch.cuda.empty_cache()
     logger.info(f"GPU optimizations enabled. CUDA devices: {torch.cuda.device_count()}")
 
-# Try to use cuML for GPU-accelerated sklearn (optional)
+# Try using cuML for GPU-accelerated sklearn (opt)
 try:
     from cuml.linear_model import LogisticRegression as cuLogisticRegression
     from cuml.preprocessing import StandardScaler as cuStandardScaler
@@ -285,7 +286,14 @@ def build_hpo_lookup(hpo_json: str, output_csv: str) -> bool:
 
 # HPO NEL
 class HPONEL:
-    def __init__(self, lookup_csv: str):
+    def __init__(self, lookup_csv: str, cache_dir: Optional[str] = None):
+        """
+        Initialize HPO NEL with persistent embedding cache.
+        
+        Args:
+            lookup_csv: Path to HPO lookup CSV file
+            cache_dir: Directory for cache files (defaults to same directory as lookup_csv)
+        """
         try:
             validate_file_exists(lookup_csv, "HPO lookup CSV")
             
@@ -293,17 +301,29 @@ class HPONEL:
             self.df = pd.read_csv(lookup_csv)
             logger.info(f"Loaded {len(self.df)} HPO terms")
             
+            # Determine cache directory
+            if cache_dir is None:
+                cache_dir = str(Path(lookup_csv).parent)
+            else:
+                cache_dir = str(Path(cache_dir))
+                Path(cache_dir).mkdir(parents=True, exist_ok=True)
+            
+            # Generate cache filename based on vocabulary hash and model name
+            model_name = "all-MiniLM-L6-v2"
+            vocab_hash = self._compute_vocab_hash(self.df["term"].tolist())
+            cache_filename = f"embeddings_cache_{model_name.replace('-', '_')}_{vocab_hash[:12]}.npy"
+            self.cache_path = Path(cache_dir) / cache_filename
+            
             logger.info("Loading sentence encoder...")
             # Explicitly set device for GPU acceleration
-            self.encoder = SentenceTransformer("all-MiniLM-L6-v2", device=DEVICE)
+            self.encoder = SentenceTransformer(model_name, device=DEVICE)
             
-            logger.info("Encoding HPO terms (this may take a moment)...")
-            self.embeddings = self.encoder.encode(
+            # Load or compute embeddings
+            self.embeddings = self._load_or_compute_embeddings(
                 self.df["term"].tolist(),
-                convert_to_tensor=True,
-                device=DEVICE,  # Ensure encoding happens on GPU
-                show_progress_bar=True
+                batch_size=256
             )
+            
             logger.info(f"[OK] HPO NEL ready on {DEVICE}")
             
             # Cache for repeated queries
@@ -312,6 +332,71 @@ class HPONEL:
         except Exception as e:
             logger.error(f"Failed to initialize HPO NEL: {e}")
             raise
+    
+    def _compute_vocab_hash(self, terms: List[str]) -> str:
+        """Compute hash of vocabulary for cache validation"""
+        vocab_str = "|".join(sorted(terms))
+        return hashlib.sha256(vocab_str.encode('utf-8')).hexdigest()
+    
+    def _load_or_compute_embeddings(self, terms: List[str], batch_size: int = 256) -> torch.Tensor:
+        """
+        Load embeddings from cache if available, otherwise compute and save.
+        
+        Args:
+            terms: List of terms to embed
+            batch_size: Batch size for encoding (used only when computing)
+        
+        Returns:
+            torch.Tensor: Embeddings tensor on appropriate device
+        """
+        # Check if cache exists
+        if self.cache_path.exists():
+            try:
+                logger.info(f"Loading cached embeddings from disk: {self.cache_path}")
+                # Load numpy array from disk
+                embeddings_np = np.load(self.cache_path)
+                
+                # Convert to torch tensor
+                embeddings_tensor = torch.from_numpy(embeddings_np).float()
+                
+                # Move to appropriate device
+                embeddings_tensor = embeddings_tensor.to(DEVICE)
+                
+                logger.info(f"Loaded {len(embeddings_tensor)} cached embeddings ({embeddings_tensor.shape[1]}-dimensional)")
+                return embeddings_tensor
+                
+            except Exception as e:
+                logger.warning(f"Failed to load cache file {self.cache_path}: {e}")
+                logger.info("Will recompute embeddings...")
+        
+        # Cache doesn't exist or failed to load - compute embeddings
+        logger.info("Computing embeddings (first run only)...")
+        logger.info(f"This may take a moment for {len(terms)} terms...")
+        
+        embeddings_tensor = self.encoder.encode(
+            terms,
+            convert_to_tensor=True,
+            device=DEVICE,
+            show_progress_bar=True,
+            batch_size=batch_size
+        )
+        
+        # Save to disk as numpy array
+        try:
+            # Convert to numpy for saving (CPU-based operation)
+            embeddings_np = embeddings_tensor.cpu().numpy()
+            np.save(self.cache_path, embeddings_np)
+            logger.info(f"Saved embeddings cache to disk: {self.cache_path}")
+            logger.info(f"Cache file size: {self.cache_path.stat().st_size / (1024**2):.2f} MB")
+            
+            # Move back to device
+            embeddings_tensor = embeddings_tensor.to(DEVICE)
+            
+        except Exception as e:
+            logger.warning(f"Failed to save cache to {self.cache_path}: {e}")
+            logger.warning("Continuing without cache - embeddings will be recomputed on next run")
+        
+        return embeddings_tensor
 
     def link(self, text: str) -> Optional[Dict]:
         """Link text to HPO concept with caching - GPU optimized"""
