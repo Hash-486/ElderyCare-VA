@@ -1,0 +1,250 @@
+# ============================================================
+# INSTALL (RUN ONCE)
+# ============================================================
+# !pip install -q openai-whisper transformers torch pandas sentence-transformers scikit-learn joblib openai
+
+# ============================================================
+# IMPORTS
+# ============================================================
+import whisper
+import pandas as pd
+from transformers import pipeline
+from sentence_transformers import SentenceTransformer, util
+from datetime import datetime
+import joblib
+import os
+import json
+
+from openai import OpenAI
+
+# ============================================================
+# 🔑 LLM CONFIG (SAFE)
+# ============================================================
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
+LLM_MODEL = "gpt-4o-mini"
+
+# ============================================================
+# MEDICAL PIPELINE CONFIG
+# ============================================================
+NER_MODEL = "d4data/biomedical-ner-all"
+NER_THRESHOLD = 0.60
+NEL_THRESHOLD = 0.65
+ALLOWED_NER_LABELS = {"Sign_symptom", "Disease_disorder"}
+
+MODEL_PATH = "/content/risk_model.joblib"
+SCALER_PATH = "/content/risk_scaler.joblib"
+HPO_LOOKUP = "/content/hpo_lookup.csv"
+EVENT_STORE = "/content/patient_events.csv"
+
+# ============================================================
+# STT
+# ============================================================
+class VoiceToTextPipeline:
+    def __init__(self):
+        self.model = whisper.load_model("base")
+
+    def transcribe(self, audio_path):
+        return self.model.transcribe(audio_path, language="en", fp16=False)["text"]
+
+# ============================================================
+# NER
+# ============================================================
+class ClinicalNER:
+    def __init__(self):
+        self.ner = pipeline("ner", model=NER_MODEL, tokenizer=NER_MODEL, aggregation_strategy="simple")
+
+    def extract(self, text):
+        out = []
+        for r in self.ner(text):
+            if r["score"] >= NER_THRESHOLD and r["entity_group"] in ALLOWED_NER_LABELS:
+                out.append(r["word"])
+        return list(set(out))
+
+# ============================================================
+# HPO LINKER
+# ============================================================
+class HPONEL:
+    def __init__(self, lookup_csv):
+        self.df = pd.read_csv(lookup_csv)
+        self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.embeddings = self.encoder.encode(self.df["term"].tolist(), convert_to_tensor=True)
+
+    def link(self, text):
+        q = self.encoder.encode(text.lower(), convert_to_tensor=True)
+        scores = util.cos_sim(q, self.embeddings)[0]
+        idx = scores.argmax().item()
+        if scores[idx].item() < NEL_THRESHOLD:
+            return None
+        return self.df.iloc[idx]
+
+# ============================================================
+# EVENT STORE
+# ============================================================
+def save_events(events):
+    df = pd.DataFrame(events)
+    if os.path.exists(EVENT_STORE):
+        df_old = pd.read_csv(EVENT_STORE)
+        df = pd.concat([df_old, df])
+    df.to_csv(EVENT_STORE, index=False)
+
+# ============================================================
+# AUDIO → EVENTS
+# ============================================================
+def events_from_audio(audio_path, stt, ner, nel):
+    text = stt.transcribe(audio_path)
+    print("🎧 TRANSCRIPTION:", text)
+
+    ents = ner.extract(text)
+    print("✅ ENTITIES:", ents)
+
+    events = []
+    for e in ents:
+        link = nel.link(e)
+        if link is not None:
+            events.append({
+                "hp_id": link["hp_id"],
+                "concept": link["term"],
+                "timestamp": datetime.now().isoformat()
+            })
+    return text, events
+
+# ============================================================
+# TEMPORAL FEATURES
+# ============================================================
+def extract_temporal_features(events):
+    df = pd.DataFrame(events)
+    if df.empty:
+        return None
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    now = pd.Timestamp.now()
+
+    freq = df.groupby(["hp_id", "concept"]).size().reset_index(name="total_count")
+    last = df.groupby("hp_id")["timestamp"].max().reset_index()
+    last["time_since_last_hours"] = (now - last["timestamp"]).dt.total_seconds() / 3600
+
+    recent = df[df["timestamp"] >= now - pd.Timedelta(hours=24)]
+    count_24h = recent.groupby("hp_id").size().reset_index(name="count_24h")
+
+    out = freq.merge(last, on="hp_id").merge(count_24h, on="hp_id", how="left")
+    out["count_24h"] = out["count_24h"].fillna(0)
+
+    return out
+
+# ============================================================
+# FINAL RISK
+# ============================================================
+def summarize_risk(df):
+    priority = {"LOW":0, "MODERATE":1, "HIGH":2}
+    df["score"] = df["ml_risk"].map(priority)
+    top = df.sort_values("score", ascending=False).iloc[0]
+    return top["ml_risk"], top["concept"]
+
+# ============================================================
+# ✅ JSON SAFE CONVERTER (KEY FIX)
+# ============================================================
+def make_json_safe(obj):
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [make_json_safe(i) for i in obj]
+    return obj
+
+# ============================================================
+# 🧠 REAL LLM CLINICAL REASONING AGENT
+# ============================================================
+def clinical_reasoning_agent(clinical_state):
+
+    safe_state = make_json_safe(clinical_state)
+
+    prompt = f"""
+You are a clinical reasoning assistant.
+
+You are given structured outputs from a medical AI system.
+Do NOT diagnose.
+Do NOT invent facts.
+Do NOT contradict the ML risk score.
+Only reason using the provided data.
+
+Clinical state:
+{json.dumps(safe_state, indent=2)}
+
+Your task:
+1. Explain why the risk might be what it is
+2. Identify concerning symptom patterns
+3. List key contributing factors
+4. State uncertainty clearly
+
+Return JSON with keys:
+summary, concerning_patterns, contributing_factors, uncertainty_notes
+"""
+
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": "You are a careful clinical reasoning agent."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.2
+    )
+
+    return response.choices[0].message.content
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    AUDIO_FILE = "/content/daddy1.ogg"
+
+    print("🔹 Loading ML model...")
+    model = joblib.load(MODEL_PATH)
+    scaler = joblib.load(SCALER_PATH)
+
+    stt = VoiceToTextPipeline()
+    ner = ClinicalNER()
+    nel = HPONEL(HPO_LOOKUP)
+
+    print("🔹 Processing audio...")
+    transcript, events = events_from_audio(AUDIO_FILE, stt, ner, nel)
+
+    if not events:
+        print("❌ No usable medical events found.")
+        return
+
+    save_events(events)
+
+    temporal = extract_temporal_features(events)
+    X = temporal[["total_count", "count_24h", "time_since_last_hours"]]
+    Xs = scaler.transform(X)
+
+    preds = model.predict(Xs)
+    mapping = {0:"LOW", 1:"MODERATE", 2:"HIGH"}
+    temporal["ml_risk"] = [mapping[p] for p in preds]
+
+    risk, cause = summarize_risk(temporal)
+
+    print("\n📊 EVENT LEVEL RISK")
+    print(temporal)
+    print(f"\n🚨 FINAL AUDIO RISK → {risk} due to {cause}")
+
+    clinical_state = {
+        "transcript": transcript,
+        "events": events,
+        "temporal_features": temporal.to_dict(orient="records"),
+        "risk": risk,
+        "top_cause": cause
+    }
+
+    print("\n🧠 Running Clinical Reasoning Agent (LLM)...")
+    reasoning = clinical_reasoning_agent(clinical_state)
+
+    print("\n🧠 LLM CLINICAL REASONING OUTPUT")
+    print(reasoning)
+
+# ============================================================
+if __name__ == "__main__":
+    main()
